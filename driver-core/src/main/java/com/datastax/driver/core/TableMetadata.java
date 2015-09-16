@@ -48,7 +48,7 @@ public class TableMetadata extends TableOrView {
     private static final String SUPER                = "super";
     private static final String COMPOUND             = "compound";
 
-    private static final String EMPTY_TYPE           = "org.apache.cassandra.db.marshal.EmptyType";
+    private static final String EMPTY_TYPE           = "empty";
 
     private final Map<String, IndexMetadata> indexes;
 
@@ -69,7 +69,7 @@ public class TableMetadata extends TableOrView {
         this.views = new HashMap<String, MaterializedViewMetadata>();
     }
 
-    static TableMetadata build(KeyspaceMetadata ksm, Row row, Map<String, ColumnMetadata.Raw> rawCols, List<Row> indexRows, String nameColumn, VersionNumber cassandraVersion, ProtocolVersion protocolVersion, CodecRegistry codecRegistry) {
+    static TableMetadata build(KeyspaceMetadata ksm, Row row, Map<String, ColumnMetadata.Raw> rawCols, List<Row> indexRows, String nameColumn, VersionNumber cassandraVersion, Cluster cluster) {
 
         String name = row.getString(nameColumn);
 
@@ -83,6 +83,9 @@ public class TableMetadata extends TableOrView {
         CassandraTypeParser.ParseResult comparator = null;
         CassandraTypeParser.ParseResult keyValidator = null;
         List<String> columnAliases = null;
+
+        ProtocolVersion protocolVersion = cluster.getConfiguration().getProtocolOptions().getProtocolVersion();
+        CodecRegistry codecRegistry = cluster.getConfiguration().getCodecRegistry();
 
         if (cassandraVersion.getMajor() <= 2) {
             comparator = CassandraTypeParser.parseWithComposite(row.getString(COMPARATOR), protocolVersion, codecRegistry);
@@ -180,7 +183,13 @@ public class TableMetadata extends TableOrView {
         }
 
         for (ColumnMetadata.Raw rawCol : rawCols.values()) {
-            ColumnMetadata col = ColumnMetadata.fromRaw(tm, rawCol);
+            DataType dataType;
+            if(cassandraVersion.getMajor() >= 3) {
+                dataType = DataTypeParser.parse(rawCol.dataType, cluster, ksm.getName(), ksm.userTypes, false);
+            } else {
+                dataType = CassandraTypeParser.parseOne(rawCol.dataType, protocolVersion, codecRegistry);
+            }
+            ColumnMetadata col = ColumnMetadata.fromRaw(tm, rawCol, dataType);
             switch (rawCol.kind) {
                 case PARTITION_KEY:
                     partitionKey.set(rawCol.position, col);
@@ -250,8 +259,9 @@ public class TableMetadata extends TableOrView {
         Iterator<ColumnMetadata.Raw> it = cols.iterator();
         while(it.hasNext()) {
             ColumnMetadata.Raw col = it.next();
-            if(col.kind == ColumnMetadata.Raw.Kind.REGULAR && col.dataType instanceof DataType.CustomType && EMPTY_TYPE.equals(((DataType.CustomType)col.dataType).getCustomTypeClassName())) {
-                // remove "value EmptyType" regular column
+            if (col.kind == ColumnMetadata.Raw.Kind.REGULAR
+                && col.dataType.equals(EMPTY_TYPE)) {
+                // remove "value empty" regular column
                 it.remove();
             }
         }
@@ -385,6 +395,7 @@ public class TableMetadata extends TableOrView {
         return sb.toString();
     }
 
+    @Override
     protected String asCQLQuery(boolean formatted) {
         StringBuilder sb = new StringBuilder();
         sb.append("CREATE TABLE ").append(Metadata.escapeId(keyspace.getName())).append('.').append(Metadata.escapeId(name)).append(" (");

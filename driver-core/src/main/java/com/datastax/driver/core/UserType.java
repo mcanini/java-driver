@@ -25,11 +25,117 @@ import com.google.common.collect.Iterators;
  * <p>
  * A UDT is a essentially a named collection of fields (with a name and a type).
  */
-public class UserType extends DataType implements Iterable<UserType.Field>{
+public class UserType extends DataType implements Iterable<UserType.Field> {
 
     private static final String TYPE_NAME  = "type_name";
     private static final String COLS_NAMES = "field_names";
     private static final String COLS_TYPES = "field_types";
+
+    /**
+     * A dependency graph to resolve dependencies between
+     * user-defined types.
+     * For C* 3+, user-defined type resolution must be done in proper order
+     * to guarantee that nested UDTs get resolved;
+     * this class provides topological sort for a given set
+     * of UDTs, implementing Kahn's algorithm.
+     *
+     * @see <a href="https://en.wikipedia.org/wiki/Topological_sorting">Topological sorting</a>
+     */
+    static class UserTypeDependencyGraph implements Iterable<Row> {
+
+        static class Vertex {
+            int refCount = 0;
+            final Row row;
+            public Vertex(Row row) {
+                this.row = row;
+            }
+        }
+
+        static class Edge {
+            final Vertex from;
+            final Vertex to;
+            public Edge(Vertex from, Vertex to) {
+                this.from = from;
+                this.to = to;
+            }
+        }
+
+        private final List<Row> rows;
+        private final Cluster cluster;
+        private final String keyspace;
+
+        // note that rows must contain ALL UDTs for a given keyspace
+        UserTypeDependencyGraph(List<Row> rows, Cluster cluster, String keyspace) {
+            this.rows = rows;
+            this.cluster = cluster;
+            this.keyspace = keyspace;
+        }
+
+        @Override
+        public Iterator<Row> iterator() {
+            Vertex[] vertices = new Vertex[rows.size()];
+            List<Edge> edges = new ArrayList<Edge>();
+            for (int i = 0; i < vertices.length; i++) {
+                vertices[i] = new Vertex(rows.get(i));
+            }
+            for (Vertex from : vertices) {
+                for (Vertex to : vertices) {
+                    if (from != to && dependsOn(to.row, from.row))
+                        edges.add(new Edge(from, to));
+                }
+            }
+            for (Edge edge : edges) {
+                edge.to.refCount++;
+            }
+            Queue<Vertex> queue = new LinkedList<Vertex>();
+            for (Vertex vertex : vertices) {
+                if (vertex.refCount == 0)
+                    queue.add(vertex);
+            }
+            Row[] rows = new Row[vertices.length];
+            int i = 0;
+            while (!queue.isEmpty()) {
+                Vertex v = queue.remove();
+                rows[i++] = v.row;
+                for (Edge edge : edges)
+                    if (edge.from == v && --edge.to.refCount == 0)
+                        queue.add(edge.to);
+            }
+            return Iterators.forArray(rows);
+        }
+
+        boolean dependsOn(Row udt1, Row udt2) {
+            List<String> fieldTypes = udt1.getList(UserType.COLS_TYPES, String.class);
+            String typeName = udt2.getString(UserType.TYPE_NAME);
+            for (String fieldTypeStr : fieldTypes) {
+                // this will parse udts as unresolved types, which is what we want here
+                DataType fieldType = DataTypeParser.parse(fieldTypeStr, cluster, keyspace, null, false);
+                if (references(fieldType, typeName))
+                    return true;
+            }
+            return false;
+        }
+
+        boolean references(DataType dataType, String typeName) {
+            if (dataType instanceof UserType) {
+                assert dataType instanceof UnresolvedUserType;
+                if (((UserType)dataType).getTypeName().equals(typeName))
+                    return true;
+            }
+            for (DataType arg : dataType.getTypeArguments()) {
+                if (references(arg, typeName))
+                    return true;
+            }
+            if (dataType instanceof TupleType) {
+                for (DataType arg : ((TupleType)dataType).getComponentTypes()) {
+                    if (references(arg, typeName))
+                        return true;
+                }
+            }
+            return false;
+        }
+
+    }
 
     private final String keyspace;
     private final String typeName;
@@ -40,11 +146,11 @@ public class UserType extends DataType implements Iterable<UserType.Field>{
     // Note that we don't expose the order of fields, from an API perspective this is a map
     // of String->Field, but internally we care about the order because the serialization format
     // of UDT expects a particular order.
-    final Field[] byIdx;
+    private final Field[] byIdx;
     // For a given name, we can only have one field with that name, so we don't need a int[] in
     // practice. However, storing one element arrays save allocations in UDTValue.getAllIndexesOf
     // implementation.
-    final Map<String, int[]> byName;
+    private final Map<String, int[]> byName;
 
     UserType(String keyspace, String typeName, Collection<Field> fields, ProtocolVersion protocolVersion, CodecRegistry codecRegistry) {
         super(DataType.Name.UDT);
@@ -62,7 +168,10 @@ public class UserType extends DataType implements Iterable<UserType.Field>{
         this.byName = builder.build();
     }
 
-    static UserType build(Row row, ProtocolVersion protocolVersion, CodecRegistry codecRegistry) {
+    static UserType build(KeyspaceMetadata ksm, Row row, VersionNumber version, Cluster cluster, Map<String, UserType> userTypes) {
+        ProtocolVersion protocolVersion = cluster.getConfiguration().getProtocolOptions().getProtocolVersion();
+        CodecRegistry codecRegistry = cluster.getConfiguration().getCodecRegistry();
+
         String keyspace = row.getString(KeyspaceMetadata.KS_NAME);
         String name = row.getString(TYPE_NAME);
 
@@ -70,9 +179,15 @@ public class UserType extends DataType implements Iterable<UserType.Field>{
         List<String> fieldTypes = row.getList(COLS_TYPES, String.class);
 
         List<Field> fields = new ArrayList<Field>(fieldNames.size());
-        for (int i = 0; i < fieldNames.size(); i++)
-            fields.add(new Field(fieldNames.get(i), CassandraTypeParser.parseOne(fieldTypes.get(i), protocolVersion, codecRegistry)));
-
+        for (int i = 0; i < fieldNames.size(); i++) {
+            DataType fieldType;
+            if (version.getMajor() >= 3.0) {
+                fieldType = DataTypeParser.parse(fieldTypes.get(i), cluster, ksm.getName(), userTypes, false);
+            } else {
+                fieldType = CassandraTypeParser.parseOne(fieldTypes.get(i), protocolVersion, codecRegistry);
+            }
+            fields.add(new Field(fieldNames.get(i), fieldType));
+        }
         return new UserType(keyspace, name, fields, protocolVersion, codecRegistry);
     }
 
@@ -169,6 +284,14 @@ public class UserType extends DataType implements Iterable<UserType.Field>{
         return true;
     }
 
+    Field[] getFields() {
+        return byIdx;
+    }
+
+    Map<String, int[]> getFieldIndicesByName() {
+        return byName;
+    }
+
     @Override
     public int hashCode() {
         int result = name.hashCode();
@@ -179,8 +302,8 @@ public class UserType extends DataType implements Iterable<UserType.Field>{
     }
 
     @Override
-    public final boolean equals(Object o) {
-        if(!(o instanceof UserType))
+    public boolean equals(Object o) {
+        if (!(o instanceof UserType))
             return false;
 
         UserType other = (UserType)o;
@@ -190,7 +313,7 @@ public class UserType extends DataType implements Iterable<UserType.Field>{
         return name.equals(other.name)
             && keyspace.equals(other.keyspace)
             && typeName.equals(other.typeName)
-            && Arrays.equals(byIdx, other.byIdx);
+            && Arrays.equals(getFields(), other.getFields());
     }
 
     /**
@@ -301,7 +424,7 @@ public class UserType extends DataType implements Iterable<UserType.Field>{
 
         @Override
         public final boolean equals(Object o) {
-            if(!(o instanceof Field))
+            if (!(o instanceof Field))
                 return false;
 
             Field other = (Field)o;

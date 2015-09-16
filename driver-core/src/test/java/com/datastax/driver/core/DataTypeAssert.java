@@ -56,4 +56,12 @@ public class DataTypeAssert extends AbstractAssert<DataTypeAssert, DataType> {
         assertThat(actual.getTypeArguments()).containsExactly(expected);
         return this;
     }
+
+    public DataTypeAssert hasField(String name, DataType expected) {
+        assertThat(actual).isInstanceOf(UserType.class);
+        UserType userType = (UserType)this.actual;
+        assertThat(userType.getFieldType(name)).isEqualTo(expected);
+        return this;
+    }
+
 }
