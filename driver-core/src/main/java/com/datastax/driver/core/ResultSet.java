@@ -56,6 +56,14 @@ public interface ResultSet extends Iterable<Row> {
     public boolean isExhausted();
 
     /**
+     * Returns the latency incurred since the time a RequestHandler started
+     * handling the query for this ResultSet.
+     *
+     * @return the latency in nanoseconds of this ResultSet.
+     */
+    public long latency();
+
+    /**
      * Returns the next result from this ResultSet.
      *
      * @return the next row in this resultSet or null if this ResultSet is
