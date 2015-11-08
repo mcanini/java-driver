@@ -64,10 +64,10 @@ class DefaultResultSetFuture extends AbstractFuture<ResultSet> implements Result
                         case SET_KEYSPACE:
                             // propagate the keyspace change to other connections
                             session.poolsState.setKeyspace(((Responses.Result.SetKeyspace)rm).keyspace);
-                            set(ArrayBackedResultSet.fromMessage(rm, session, protocolVersion, info, statement));
+                            set(ArrayBackedResultSet.fromMessage(rm, session, protocolVersion, info, statement, latency));
                             break;
                         case SCHEMA_CHANGE:
-                            ResultSet rs = ArrayBackedResultSet.fromMessage(rm, session, protocolVersion, info, statement);
+                            ResultSet rs = ArrayBackedResultSet.fromMessage(rm, session, protocolVersion, info, statement, latency);
                             final Cluster.Manager cluster = session.cluster.manager;
                             if (!cluster.configuration.getQueryOptions().isMetadataEnabled()) {
                                 cluster.waitForSchemaAgreementAndSignal(connection, this, rs);
@@ -141,7 +141,7 @@ class DefaultResultSetFuture extends AbstractFuture<ResultSet> implements Result
                             }
                             break;
                         default:
-                            set(ArrayBackedResultSet.fromMessage(rm, session, protocolVersion, info, statement));
+                            set(ArrayBackedResultSet.fromMessage(rm, session, protocolVersion, info, statement, latency));
                             break;
                     }
                     break;
